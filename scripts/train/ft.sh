@@ -43,7 +43,7 @@ echo "MASTER_ADDR: $MASTER_ADDR"
 echo "MASTER_PORT: $MASTER_PORT"
 echo "WORLD_SIZE: $WORLD_SIZE"
 
-num_processes=$(($WORLD_SIZE * 8))
+num_processes=$(($WORLD_SIZE ))
 
 echo "num_processes: $num_processes"
 

@@ -1,5 +1,15 @@
-import dotenv
+import numpy as np
+if not hasattr(np, 'int'):
+    np.int = int
 
+
+import time
+import torch
+from omnigen2.pipelines.omnigen2.pipeline_omnigen2 import OmniGen2Pipeline
+from omnigen2.schedulers.scheduling_flow_match_euler_discrete import FlowMatchEulerDiscreteScheduler
+import dotenv
+from PIL import Image, ImageOps
+from typing import List, Tuple
 dotenv.load_dotenv(override=True)
 
 import time
@@ -14,11 +24,11 @@ from pathlib import Path
 from omegaconf import OmegaConf
 from tqdm.auto import tqdm
 
-import numpy as np
+
 
 import matplotlib.pyplot as plt
 
-import torch
+
 
 import torch.nn.functional as F
 import torch.utils.checkpoint
@@ -47,14 +57,45 @@ from peft import LoraConfig
 from omnigen2.training_utils import EMAModel
 from omnigen2.utils.logging_utils import TqdmToLogger
 from omnigen2.transport import create_transport
-from omnigen2.dataset.omnigen2_train_dataset import OmniGen2TrainDataset, OmniGen2Collator
+from omnigen2.dataset.inpaintPro import OmniGen2TrainDataset, OmniGen2Collator
 from omnigen2.models.transformers.transformer_omnigen2 import OmniGen2Transformer2DModel
 from omnigen2.models.transformers.repo import OmniGen2RotaryPosEmbed
-
-
+from transformers import Qwen2_5_VLProcessor
+from transformers import Qwen2TokenizerFast
 logger = get_logger(__name__)
 
+
+
+def create_dataloader_for_stage(stage_config, args, text_tokenizer, worker_init_fn):
+    """Create a new dataloader for the current training stage"""
     
+    # Create new dataset with stage-specific parameters
+    train_dataset = OmniGen2TrainDataset(
+        tokenizer=text_tokenizer,
+        use_chat_template=args.data.use_chat_template,
+        prompt_dropout_prob=args.data.get('prompt_dropout_prob', 0.0),
+        ref_img_dropout_prob=args.data.get('ref_img_dropout_prob', 0.0),
+        max_input_pixels=stage_config['max_pixels'],  # Use stage resolution
+        max_output_pixels=stage_config['max_pixels'], # Use stage resolution
+        max_side_length=stage_config['resolution'],   # Use stage resolution
+    )
+    
+    # Create new dataloader
+    train_dataloader = torch.utils.data.DataLoader(
+        train_dataset,
+        shuffle=True,
+        batch_size=args.train.batch_size,
+        num_workers=args.train.dataloader_num_workers,
+        worker_init_fn=worker_init_fn,
+        drop_last=True,
+        collate_fn=OmniGen2Collator(tokenizer=text_tokenizer, max_token_len=args.data.maximum_text_tokens)
+    )
+    
+    return train_dataset, train_dataloader
+
+
+
+
 def parse_args(root_path) -> OmegaConf:
     parser = argparse.ArgumentParser(description="OmniGen2 training script")
     parser.add_argument(
@@ -70,15 +111,16 @@ def parse_args(root_path) -> OmegaConf:
         help="Global batch size.",
     )
     parser.add_argument(
-        "--data_path",
-        type=str,
-        default=None,
-        help="Data path.",
+        "--num_shards",
+        type=int,
+        default=2,
+        help="Number of webdataset shards to load from jackyhate/text-to-image-2M",
     )
     args = parser.parse_args()
     conf = OmegaConf.load(args.config)
 
-    output_dir = os.path.join(root_path, 'experiments', conf.name)
+    # output_dir = os.path.join(root_path, 'experiments', conf.name)+str(time.time())
+    output_dir = os.path.join(root_path, 'experiments', "ft_lora_proper_inpaint_bg_dataset_no_margin")
     conf.root_dir = root_path
     conf.output_dir = output_dir
     conf.config_file = args.config
@@ -87,8 +129,8 @@ def parse_args(root_path) -> OmegaConf:
     if args.global_batch_size is not None:
         conf.train.global_batch_size = args.global_batch_size
     
-    if args.data_path is not None:
-        conf.data.data_path = args.data_path
+    # Add num_shards to config
+    conf.data.num_shards = args.num_shards
     return conf
 
 def setup_logging(args: OmegaConf, accelerator: Accelerator) -> None:
@@ -161,8 +203,89 @@ def log_time_distribution(transport, device, args):
     plt.savefig(save_path)
     plt.close()
     logger.info(f"Time step distribution plot saved to {save_path}")
+
+
+
+import numpy as np
+from PIL import Image
+
+def place_image_on_canvas(img, canvas_width, canvas_height, alignment='center', background_color=(128,128,128)):
+    """
+    Place an image on a canvas with specified dimensions and alignment.
     
+    Args:
+        img: PIL Image - input image to place on canvas
+        canvas_width: int - width of the canvas
+        canvas_height: int - height of the canvas
+        alignment: str - alignment option ('top', 'bottom', 'left', 'right', 'center', 
+                        'top-left', 'top-right', 'bottom-left', 'bottom-right', 'bottom-center')
+        background_color: tuple - RGB color for canvas background (default: white)
+        
+    Returns:
+        PIL Image - image placed on canvas with specified alignment
+    """
+    # Create canvas with specified dimensions and background color
+    if len(background_color) == 3:
+        canvas = Image.new('RGB', (canvas_width, canvas_height), background_color)
+    else:
+        canvas = Image.new('RGBA', (canvas_width, canvas_height), background_color)
     
+    # Get image dimensions
+    img_width, img_height = img.size
+    
+    # Calculate position based on alignment
+    if alignment == 'center':
+        x = (canvas_width - img_width) // 2
+        y = (canvas_height - img_height) // 2
+    elif alignment == 'top':
+        x = (canvas_width - img_width) // 2
+        y = 0
+    elif alignment == 'bottom':
+        x = (canvas_width - img_width) // 2
+        y = canvas_height - img_height
+    elif alignment == 'bottom-center':
+        x = (canvas_width - img_width) // 2
+        y = canvas_height - img_height
+    elif alignment == 'left':
+        x = 0
+        y = (canvas_height - img_height) // 2
+    elif alignment == 'right':
+        x = canvas_width - img_width
+        y = (canvas_height - img_height) // 2
+    elif alignment == 'top-left':
+        x = 0
+        y = 0
+    elif alignment == 'top-right':
+        x = canvas_width - img_width
+        y = 0
+    elif alignment == 'bottom-left':
+        x = 0
+        y = canvas_height - img_height
+    elif alignment == 'bottom-right':
+        x = canvas_width - img_width
+        y = canvas_height - img_height
+    else:
+        # Default to center if alignment not recognized
+        x = (canvas_width - img_width) // 2
+        y = (canvas_height - img_height) // 2
+    
+    # Ensure coordinates are within bounds
+    x = max(0, min(x, canvas_width - img_width))
+    y = max(0, min(y, canvas_height - img_height))
+    
+    # Paste the image onto the canvas
+    if img.mode == 'RGBA':
+        canvas.paste(img, (x, y), img)  # Use alpha channel for transparency
+    else:
+        canvas.paste(img, (x, y))
+    
+    return canvas
+
+
+
+
+
+
 def main(args):
     accelerator_project_config = ProjectConfiguration(project_dir=args.output_dir, logging_dir=Path(args.output_dir, 'logs'))
 
@@ -173,6 +296,192 @@ def main(args):
         project_config=accelerator_project_config,
     )
 
+
+
+    
+    qwen_processor = Qwen2_5_VLProcessor.from_pretrained("Qwen/Qwen2.5-VL-3B-Instruct")
+    def preprocess_fixed_images(input_image_path: List[str] = []) -> List[Image.Image]:
+        """Preprocess the input images."""
+        from PIL import Image, ImageOps
+        import os
+        
+        input_images = []
+        if input_image_path:
+            if isinstance(input_image_path, str):
+                input_image_path = [input_image_path]
+            if len(input_image_path) == 1 and os.path.isdir(input_image_path[0]):
+                input_images = [Image.open(os.path.join(input_image_path[0], f)).convert('RGB') 
+                              for f in os.listdir(input_image_path[0])]
+            else:
+                input_images = [Image.open(path).convert('RGB') for path in input_image_path]
+            input_images = [ImageOps.exif_transpose(img) for img in input_images]
+        return input_images
+    
+    def resize_image(image, max_size=1024):
+        """Resize image while maintaining aspect ratio"""
+        from PIL import Image
+        
+        # Get original dimensions
+        original_width, original_height = image.size
+        # If image is already smaller than max_size, return as-is
+        if original_width <= max_size and original_height <= max_size:
+            return image
+        # Calculate the scaling factor
+        if original_width > original_height:
+            # Width is the limiting dimension
+            new_width = max_size
+            new_height = int((original_height * max_size) / original_width)
+        else:
+            # Height is the limiting dimension
+            new_height = max_size
+            new_width = int((original_width * max_size) / original_height)
+        # Resize using high-quality resampling
+        resized_image = image.resize((new_width, new_height), Image.Resampling.LANCZOS)
+        return resized_image
+    
+    def get_fixed_test_cases(root_dir):
+        """Get fixed test cases for evaluation during training"""
+        negative_prompt = "(((deformed))), blurry, over saturation, bad anatomy, disfigured, poorly drawn face, mutation, mutated, (extra_limb), (ugly), (poorly drawn hands), fused fingers, messy drawing, broken legs censor, censored, censor_bar"
+        
+        # Define your fixed test cases
+
+        inputs = [
+#             (f""""<|im_start|>system
+# You are a helpful assistant that generates high-quality virtual try-on images based on user instructions.<|im_end|>
+# <|im_start|>user
+# Fill the black area in image1 with clothing in image2<|im_end|>
+# """ , 
+#              ["vton/262208_front/bboxed_model.jpg",
+#               "example_images/bf5e132d9b04e347365118427592e33e39ae5bad.jpg"]),
+#             (f""""<|im_start|>system
+# You are a helpful assistant that generates high-quality virtual try-on images based on user instructions.<|im_end|>
+# <|im_start|>user
+# Fill the black area in image1 with clothing in image2<|im_end|>
+# """ , 
+#              ["vton/262208_front/bboxed_model.jpg",
+#               "example_images/f3979db3a2dab4a04259b0bef35ae5719bb52bc8.jpg"]),
+#             (f""""<|im_start|>system
+# You are a helpful assistant that generates high-quality virtual try-on images based on user instructions.<|im_end|>
+# <|im_start|>user
+# Fill the black area in image1 with clothing in image2<|im_end|>
+# """ , 
+#              ["vton/262208_front/bboxed_model.jpg",
+#               "example_images/4442fbac4e3080ec20b2f14e353fea267249b0dd.jpg"]),
+
+#             ( "Fill the masked face area in image2 using the reference face in image1",[ "human_test/inpaintimg.jpg", "human_Dataset/Original Images/Tom Cruise/Tom Cruise_0.jpg"]),
+#             ( "Fill the masked face area in image2 using the reference face in image1",[ "human_test/inpaintimg.jpg", "human_Dataset/Original Images/Hrithik Roshan/Hrithik Roshan_6.jpg"]),
+#             ( "Fill the masked face area in image2 using the reference face in image1",[ "human_test/inpaintimg.jpg", "human_Dataset/Original Images/Amitabh Bachchan/Amitabh Bachchan_29.jpg"]),
+
+            ("inpaint the grey part with appropriate image" , ["vton/262208_front/bboxed_model.jpg"]),
+            ("inpaint the grey part with appropriate image" , ["example_images/bf5e132d9b04e347365118427592e33e39ae5bad.jpg"]),
+            ("inpaint the grey part with appropriate image" , ["example_images/f3979db3a2dab4a04259b0bef35ae5719bb52bc8.jpg"]),
+            ("inpaint the grey part with appropriate image" , ["example_images/4442fbac4e3080ec20b2f14e353fea267249b0dd.jpg"]),
+            ("inpaint the grey part with appropriate image" , ["human_Dataset/Original Images/Tom Cruise/Tom Cruise_0.jpg"]),
+            ("inpaint the grey part with appropriate image" , ["human_Dataset/Original Images/Hrithik Roshan/Hrithik Roshan_6.jpg"]),
+            ("inpaint the grey part with appropriate image" , ["example_images/realimages/bottom_1757176369_8.jpg"]),
+            ("inpaint the grey part with appropriate image" , ["example_images/realimages/bottom_1757176525_5.jpg"]),
+            ("inpaint the grey part with appropriate image" , ["example_images/realimages/back_1757176533_3.jpg"]),
+            ("inpaint the grey part with appropriate image" , ["example_images/realimages/left_1757180555_3.jpg"]),
+            ("inpaint the grey part with appropriate image" , ["example_images/realimages/top_1757180555_5.jpg"]),
+            ("inpaint the grey part with appropriate image" , ["example_images/realimages/back_1757180564_4.jpg"]),
+            ("inpaint the grey part with appropriate image" , ["example_images/realimages/bottom_1757180564_5.jpg"]),
+            ("inpaint the grey part with appropriate image" , ["example_images/realimages/top_1757181631_6.jpg"]),
+             
+        ]
+        
+        return inputs, negative_prompt
+    
+    def generate_full_images_during_training(
+        pipeline, 
+        global_step, 
+        args, 
+        num_inference_steps=50,
+        text_guidance_scale=4.0,
+        image_guidance_scale=2.0
+    ):
+        """Generate full denoised images during training for evaluation using fixed test cases"""
+        import matplotlib.pyplot as plt
+        from PIL import Image
+        
+        # Create the pipeline from your current models
+        pipeline.transformer = accelerator.unwrap_model(model)
+        if ema_decay != 0:
+            # Use EMA model for better quality
+            pipeline.transformer = accelerator.unwrap_model(model_ema.averaged_model)
+        
+        pipeline.transformer.eval()
+        
+        # Get fixed test cases
+        inputs, negative_prompt = get_fixed_test_cases(args.root_dir)
+        
+        with torch.no_grad():
+            for test_idx, (instruction, input_image_paths) in enumerate(inputs):
+                
+                    # Preprocess input images
+                input_images = preprocess_fixed_images(input_image_paths)
+                
+                    
+                    # Resize images if needed
+                for i in range(len(input_images)):
+                    input_images[i] = resize_image(place_image_on_canvas(input_images[i].resize((718,718)) ,  1024, 1024, alignment='center'), max_size=1024)
+                    
+                    # Generate with pipeline
+                generator = torch.Generator(device=accelerator.device).manual_seed(0)
+                results = pipeline(
+                        prompt=instruction,
+                        input_images=input_images,
+                        num_inference_steps=num_inference_steps,
+                        max_sequence_length=1024,
+                        text_guidance_scale=text_guidance_scale,
+                        image_guidance_scale=image_guidance_scale,
+                        negative_prompt=negative_prompt,
+                        num_images_per_prompt=1,
+                        generator=generator,
+                        output_type="pil",
+                        width=input_images[0].width,
+                        height=input_images[0].height,
+                    )
+                    
+                    # Save generated image
+                generated_image = results.images[0]
+                save_path = os.path.join(args.output_dir, f"fixed_test_{test_idx}_step_{global_step}.png")
+                generated_image.save(save_path)
+                    
+                    # Create comparison plot
+                total_images = len(input_images) + len(results.images)
+                fig, axes = plt.subplots(1, total_images, figsize=(5 * total_images, 5))
+                    
+                if total_images == 1:
+                    axes = [axes]  # Make it iterable for single image case
+                    
+                    # Plot input images
+                for i, input_image in enumerate(input_images):
+                    axes[i].imshow(input_image)
+                    axes[i].axis('off')
+                    axes[i].set_title(f'Input {i+1}')
+                    
+                    # Plot output images
+                for i, output_image in enumerate(results.images):
+                    axes[len(input_images) + i].imshow(output_image)
+                    axes[len(input_images) + i].axis('off')
+                    axes[len(input_images) + i].set_title(f'Output {i+1}')
+                    
+                plt.tight_layout()
+                plot_save_path = os.path.join(args.output_dir, f"comparison_test_{test_idx}_step_{global_step}.png")
+                plt.savefig(plot_save_path, dpi=150, bbox_inches='tight')
+                plt.close()
+                    
+                    # Save instruction
+                with open(os.path.join(args.output_dir, f"instruction_test_{test_idx}_step_{global_step}.txt"), "w", encoding='utf-8') as f:
+                    f.write(f"Step: {global_step}\nTest Case: {test_idx}\nInstruction: {instruction}\nInput Images: {input_image_paths}")
+                    
+                logger.info(f"Generated fixed test case {test_idx} at step {global_step}")
+                    
+                # except Exception as e:
+                #     logger.warning(f"Failed to generate test case {test_idx} at step {global_step}: {e}")
+                #     continue
+        
+        pipeline.transformer.train()
     setup_logging(args, accelerator)
     
     # Reproducibility
@@ -203,23 +512,11 @@ def main(args):
     )
     model.train()
 
-    # model = OmniGen2Transformer2DModel(**args.model.arch_opt)
-    # model.train()
-
     freqs_cis = OmniGen2RotaryPosEmbed.get_freqs_cis(
         model.config.axes_dim_rope,
         model.config.axes_lens,
         theta=10000,
     )
-
-    # if args.model.get("pretrained_model_path", None) is not None:
-    #     logger.info(f"Loading model parameters from: {args.model.pretrained_model_path}")
-    #     state_dict = torch.load(args.model.pretrained_model_path, map_location="cpu")
-    #     missing, unexpect = model.load_state_dict(state_dict, strict=False)
-    #     logger.info(
-    #         f"missed parameters: {missing}",
-    #     )
-    #     logger.info(f"unexpected parameters: {unexpect}")
 
     if ema_decay != 0:
         model_ema = deepcopy(model)
@@ -309,7 +606,6 @@ def main(args):
 
     with accelerator.main_process_first():
         train_dataset = OmniGen2TrainDataset(
-            args.data.data_path,
             tokenizer=text_tokenizer,
             use_chat_template=args.data.use_chat_template,
             prompt_dropout_prob=args.data.get('prompt_dropout_prob', 0.0),
@@ -317,6 +613,9 @@ def main(args):
             max_input_pixels=OmegaConf.to_object(args.data.get('max_input_pixels', 1024 * 1024)),
             max_output_pixels=args.data.get('max_output_pixels', 1024 * 1024),
             max_side_length=args.data.get('max_side_length', 2048),
+            # condition_size=args.data.get('condition_size', (512, 512)),
+            # target_size=args.data.get('target_size', (512, 512)),
+            # num_shards=args.data.get('num_shards', 1),
         )
 
     # default: 1000 steps, linear noise schedule
@@ -353,18 +652,25 @@ def main(args):
     else:
         worker_init_fn = None
 
-    logger.info("***** Prepare dataLoader *****")
-    train_dataloader = torch.utils.data.DataLoader(
-        train_dataset,
-        shuffle=True,
-        batch_size=args.train.batch_size,
-        num_workers=args.train.dataloader_num_workers,
-        worker_init_fn=worker_init_fn,
-        drop_last=True,
-        collate_fn=OmniGen2Collator(tokenizer=text_tokenizer, max_token_len=args.data.maximum_text_tokens)
-    )
+    # logger.info("***** Prepare dataLoader *****")
+    # train_dataloader = torch.utils.data.DataLoader(
+    #     train_dataset,
+    #     shuffle=True,
+    #     batch_size=args.train.batch_size,
+    #     num_workers=args.train.dataloader_num_workers,
+    #     worker_init_fn=worker_init_fn,
+    #     drop_last=True,
+    #     collate_fn=OmniGen2Collator(tokenizer=text_tokenizer, max_token_len=args.data.maximum_text_tokens)
+    # )
 
-    logger.info(f"{args.train.batch_size=} {args.train.gradient_accumulation_steps=} {accelerator.num_processes=} {args.train.global_batch_size=}")
+    # logger.info(f"{args.train.batch_size=} {args.train.gradient_accumulation_steps=} {accelerator.num_processes=} {args.train.global_batch_size=}")
+
+
+    print(f"Accelerate detected {accelerator.num_processes} processes")
+    print(f"Torch CUDA device count: {torch.cuda.device_count()}")
+    print(f"Current device: {accelerator.device}")
+
+
     assert (
         args.train.batch_size
         * args.train.gradient_accumulation_steps
@@ -375,11 +681,7 @@ def main(args):
     )
 
     # Scheduler and math around the number of training steps.
-    overrode_max_train_steps = False
-    num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.train.gradient_accumulation_steps)
-    if 'max_train_steps' not in args.train:
-        args.train.max_train_steps = args.train.num_train_epochs * num_update_steps_per_epoch
-        overrode_max_train_steps = True
+    
 
     if args.train.lr_scheduler == 'timm_cosine':
         from omnigen2.optim.scheduler.cosine_lr import CosineLRScheduler
@@ -416,6 +718,31 @@ def main(args):
 
     logger.info("***** Prepare everything with our accelerator *****")
 
+
+    stages_config = args.train.get('stages', [])
+    if not stages_config:
+        # Default single stage if no stages defined
+        stages_config = [{
+            'resolution': 1024,
+            'max_pixels': args.data.get('max_output_pixels', 1048576),
+            'steps': args.train.max_train_steps
+        }]
+    
+    # Calculate cumulative steps for each stage
+    cumulative_steps = []
+    total = 0
+    for stage in stages_config:
+        total += stage['steps']
+        cumulative_steps.append(total)
+    
+    current_stage_idx = 0
+    current_stage = stages_config[0]
+    
+    # Create initial dataloader for first stage
+    logger.info(f"Starting Stage 1/{len(stages_config)}: resolution={current_stage['resolution']}, max_pixels={current_stage['max_pixels']}")
+    train_dataset, train_dataloader = create_dataloader_for_stage(current_stage, args, text_tokenizer, worker_init_fn)
+
+
     if args.train.ema_decay != 0:
         model, model_ema, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
             model, model_ema, optimizer, train_dataloader, lr_scheduler
@@ -425,7 +752,11 @@ def main(args):
         model, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
             model, optimizer, train_dataloader, lr_scheduler
         )
-
+    overrode_max_train_steps = False
+    num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.train.gradient_accumulation_steps)
+    if 'max_train_steps' not in args.train:
+        args.train.max_train_steps = args.train.num_train_epochs * num_update_steps_per_epoch
+        overrode_max_train_steps = True
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.train.gradient_accumulation_steps)
     if overrode_max_train_steps:
@@ -440,7 +771,7 @@ def main(args):
 
     # Train!
     total_batch_size = args.train.batch_size * accelerator.num_processes * args.train.gradient_accumulation_steps
-
+    
     logger.info("***** Running training *****")
     logger.info(f"  Num examples = {len(train_dataset)}")
     logger.info(f"  Num batches each epoch = {len(train_dataloader)}")
@@ -492,12 +823,45 @@ def main(args):
         for tracker in accelerator.trackers:
             if tracker.name == "wandb":
                 logger.info(f"***** Wandb log dir: {tracker.run.dir} *****")
+
+
+
+
     
-    for epoch in range(first_epoch, args.train.num_train_epochs):
+    while True:
+        
         if 'max_train_steps' in args.train and global_step >= args.train.max_train_steps:
+            print("breaking HEREEE 0")
             break
+        
+        
         for step, batch in enumerate(train_dataloader):
             # Number of bins, for loss recording
+            if (current_stage_idx < len(stages_config) - 1 and 
+                global_step >= cumulative_steps[current_stage_idx]):
+                
+                current_stage_idx += 1
+                current_stage = stages_config[current_stage_idx]
+                
+                logger.info(f"Switching to Stage {current_stage_idx + 1}/{len(stages_config)}: "
+                           f"resolution={current_stage['resolution']}, max_pixels={current_stage['max_pixels']}")
+                
+                # Create new dataloader for new stage
+                train_dataset, new_dataloader = create_dataloader_for_stage(current_stage, args, text_tokenizer, worker_init_fn)
+                
+                # Prepare new dataloader with accelerator
+                if args.train.ema_decay != 0:
+                    _, _, _, train_dataloader, _ = accelerator.prepare(
+                        model, model_ema, optimizer, new_dataloader, lr_scheduler
+                    )
+                else:
+                    _, _, train_dataloader, _ = accelerator.prepare(
+                        model, optimizer, new_dataloader, lr_scheduler
+                    )
+                print("Breaking")
+                # Break out of current dataloader loop to start with new one
+                break
+
             n_loss_bins = 10
             # Create bins for t
             loss_bins = torch.linspace(0.0, 1.0, n_loss_bins + 1, device=accelerator.device)
@@ -679,6 +1043,32 @@ def main(args):
 
                                 with open(os.path.join(args.output_dir, f"instruction_{global_step}_{i}.txt"), "w", encoding='utf-8') as f:
                                     f.write(f"token len: {len(input_ids)}\ntext: {instruction}")
+                    
+                    if 'full_generation_steps' in args.val and (global_step-1) % args.val.full_generation_steps == 0:
+                        logger.info(f"Generating full images at step {global_step}")
+                            
+                            
+                        scheduler = FlowMatchEulerDiscreteScheduler()
+        
+                        pipeline = OmniGen2Pipeline(
+                            transformer=accelerator.unwrap_model(model),
+                            vae=vae,
+                            scheduler=scheduler,
+                            mllm=text_encoder,  # Assuming this is your MLLM
+                            processor=qwen_processor,  # Assuming this works as processor
+                        )
+                        pipeline = pipeline.to(accelerator.device)
+                        
+                        generate_full_images_during_training(
+                            pipeline=pipeline,
+                            global_step=global_step,
+                            args=args,
+                            num_inference_steps=args.val.get('inference_steps', 50),
+                            text_guidance_scale=args.val.get('text_guidance_scale', 5.0),
+                            image_guidance_scale=args.val.get('image_guidance_scale', 2.0)
+                        )
+                        
+                        del pipeline
 
                 progress_bar.set_postfix(**logs)
                 progress_bar.update(1)
@@ -686,6 +1076,7 @@ def main(args):
                 accelerator.log(logs, step=global_step)
 
             if 'max_train_steps' in args.train and global_step >= args.train.max_train_steps:
+                print("breaking HEREEE")
                 break
 
     checkpoints = os.listdir(args.output_dir)

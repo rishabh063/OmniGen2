@@ -29,7 +29,7 @@ if is_triton_available():
 else:
     from torch.nn import RMSNorm
 
-from ...taylorseer_utils import derivative_approximation, taylor_formula, taylor_cache_init
+from ...taylorseer_utils import derivative_approximation, taylor_formula, taylor_cache_init , firstblock_derivative_approximation , firstblock_taylor_formula , step_taylor_formula , step_derivative_approximation
 from ...cache_functions import cache_init, cal_type
 
 logger = logging.get_logger(__name__)
@@ -557,6 +557,9 @@ class OmniGen2Transformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, From
         return_dict: bool = False,
     ) -> Union[torch.Tensor, Transformer2DModelOutput]:
         enable_taylorseer = getattr(self, 'enable_taylorseer', False)
+        enable_cg_taylor=getattr(self, 'enable_cg_taylor', False)
+
+        
         if enable_taylorseer:
             cal_type(self.cache_dic, self.current)
         
@@ -642,7 +645,9 @@ class OmniGen2Transformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, From
             joint_hidden_states[i, encoder_seq_len:seq_len] = combined_img_hidden_states[i, :seq_len - encoder_seq_len]
 
         hidden_states = joint_hidden_states
-
+        if enable_cg_taylor:
+            predict_loss=None
+            can_use_cache=False
         if self.enable_teacache:
             teacache_hidden_states = hidden_states.clone()
             teacache_temb = temb.clone()
@@ -678,20 +683,73 @@ class OmniGen2Transformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, From
         else:
             if enable_taylorseer:
                 self.current['stream'] = 'layers_stream'
-
+            
             for layer_idx, layer in enumerate(self.layers):
-                if enable_taylorseer:
-                    layer.current = self.current
-                    layer.cache_dic = self.cache_dic
-                    layer.enable_taylorseer = True
-                    self.current['layer'] = layer_idx
+                
+                if enable_cg_taylor:
+                    
+                    if layer_idx==0:
+                       
+                        if torch.is_grad_enabled() and self.gradient_checkpointing:
+                            hidden_states = self._gradient_checkpointing_func(
+                                layer, hidden_states, attention_mask, rotary_emb, temb
+                            )
+                        else:
+                            hidden_states = layer(hidden_states, attention_mask, rotary_emb, temb)
+                        if self.current['step'] >4 and self.current['step']  != self.num_steps - 1: # as of now we only do this after the first 4 steps and not on the last step
+                            
+                            pre_firstblock_hidden_states = firstblock_taylor_formula(cache_dic=self.cache_dic, current=self.current)
+                            
+                            
+                            
+                            predict_loss = (
+                                    pre_firstblock_hidden_states - hidden_states
+                                ).abs().mean() / hidden_states.abs().mean()
+                            
+                            can_use_cache = predict_loss.item() < self.threshold
+                            
+                            if can_use_cache is False:
+                                
+                                self.current["block_activated_steps"].append(self.current["step"])
+                                
+                                firstblock_derivative_approximation(cache_dic=self.cache_dic, current=self.current, feature=hidden_states)
+                            
+                
+                
+                    else:
+                        # can_use_cache=False
+                        if can_use_cache:
+                            hidden_states = step_taylor_formula(cache_dic=self.cache_dic, current=self.current)
+                            
+                            
+                            break # no need to calculate after this 
+                        else:
+                            
+                            if torch.is_grad_enabled() and self.gradient_checkpointing:
+                                hidden_states = self._gradient_checkpointing_func(
+                                    layer, hidden_states, attention_mask, rotary_emb, temb
+                                )
+                            else:
+                                hidden_states = layer(hidden_states, attention_mask, rotary_emb, temb)
 
-                if torch.is_grad_enabled() and self.gradient_checkpointing:
-                    hidden_states = self._gradient_checkpointing_func(
-                        layer, hidden_states, attention_mask, rotary_emb, temb
-                    )
+                            if layer_idx==len(self.layers)-1:
+                                
+                                self.current["activated_steps"].append(self.current["step"])
+                                step_derivative_approximation(cache_dic=self.cache_dic, current=self.current, feature=hidden_states)        
+
                 else:
-                    hidden_states = layer(hidden_states, attention_mask, rotary_emb, temb)
+                    if enable_taylorseer:
+                        layer.current = self.current
+                        layer.cache_dic = self.cache_dic
+                        layer.enable_taylorseer = True
+                        self.current['layer'] = layer_idx
+                    
+                    if torch.is_grad_enabled() and self.gradient_checkpointing:
+                        hidden_states = self._gradient_checkpointing_func(
+                            layer, hidden_states, attention_mask, rotary_emb, temb
+                        )
+                    else:
+                        hidden_states = layer(hidden_states, attention_mask, rotary_emb, temb)
 
         # 4. Output norm & projection
         hidden_states = self.norm_out(hidden_states, temb)
@@ -708,7 +766,7 @@ class OmniGen2Transformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, From
             # remove `lora_scale` from each PEFT layer
             unscale_lora_layers(self, lora_scale)
             
-        if enable_taylorseer:
+        if enable_taylorseer or enable_cg_taylor:
             self.current['step'] += 1
 
         if not return_dict:

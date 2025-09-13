@@ -43,7 +43,7 @@ echo "MASTER_ADDR: $MASTER_ADDR"
 echo "MASTER_PORT: $MASTER_PORT"
 echo "WORLD_SIZE: $WORLD_SIZE"
 
-num_processes=$(($WORLD_SIZE * 8))
+num_processes=$(($WORLD_SIZE * 1))
 
 echo "num_processes: $num_processes"
 
@@ -65,4 +65,4 @@ accelerate launch  \
 --fsdp_use_orig_params True \
 --fsdp_cpu_ram_efficient_loading false \
 --fsdp_sync_module_states True \
-train.py --config options/${experiment_name}.yml
+train.py --config options/${experiment_name}.yml 

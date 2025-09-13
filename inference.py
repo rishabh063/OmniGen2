@@ -301,6 +301,7 @@ def main(args: argparse.Namespace, root_dir: str) -> None:
 
     # Load pipeline and process inputs
     pipeline = load_pipeline(args, accelerator, weight_dtype)
+    print(pipeline)
     input_images = preprocess(args.input_image_path)
 
     # Generate and save image
